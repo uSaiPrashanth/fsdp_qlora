@@ -60,6 +60,7 @@ from accelerate.utils import set_seed
 from transformers.utils import hub, SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from fastcore.parallel import parallel
 
 try:
@@ -259,21 +260,22 @@ PROMPT_DICT = {
     "prompt_input": (
         "Below is an instruction that describes a task, paired with an input that provides further context. "
         "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+        "### Instruction:\n{instruction}\n\n<|gist|>### Input:\n{input}\n\n### Response:"
     ),
     "prompt_no_input": (
         "Below is an instruction that describes a task. "
         "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
+        "### Instruction:\n{instruction}\n\n<|gist|>### Response:"
     ),
 }
 
 # Dataset class
 class InstructionDataset(Dataset):
-    def __init__(self, dataset, tokenizer, style="alpaca"):
+    def __init__(self, dataset, tokenizer, style="alpaca", use_gist_token=False):
         self.dataset = dataset
         self.tokenizer = tokenizer
         self.style = style
+        self.use_gist_token = use_gist_token
 
     def __len__(self):
         return len(self.dataset)
@@ -284,7 +286,7 @@ class InstructionDataset(Dataset):
             prompt = self.dataset[index]["text"].split("### Assistant: ")[0]
             example = self.dataset[index]["text"]
         elif self.style == "qna":
-            prompt_template = "###Context:\n{context}\n###Question:\n{question}\n###Answer:\n"
+            prompt_template = "###Context:\n{context}\n<|gist|>###Question:\n{question}\n###Answer:\n"
             sample = self.dataset[index]
             prompt = prompt_template.format_map(sample)
             example = prompt + sample['answer']
@@ -301,6 +303,9 @@ class InstructionDataset(Dataset):
                 prompt = PROMPT_DICT["prompt_input"].format_map(ann)
             example = prompt + ann["output"]
 
+        if not self.use_gist_token:
+            example = example.replace("<|gist|>", "")
+            prompt = prompt.replace("<|gist|>", "")
         prompt = torch.tensor(
             self.tokenizer.encode(prompt), dtype=torch.int64
         )
@@ -322,8 +327,25 @@ class InstructionDataset(Dataset):
             "attention_mask":example_mask.tolist(),
         }
 
+def get_gist_mask(tok_ids, attention_mask, gist_token_id, dtype=torch.float16):
+    """Returns GIST based masking for autoregressive models
+    """
+    if gist_token_id is None: # Not using gist tokens, return
+        return attention_mask
+
+    seq_len = attention_mask.shape[-1]
+
+    causal_mask = AttentionMaskConverter(is_causal=True).to_4d(attention_mask, seq_len, dtype, seq_len)
+    
+    dtype_min = torch.finfo(dtype).min
+    gist_token_positions = torch.stack(torch.where(tok_ids == gist_token_id)).T
+    for position in gist_token_positions:
+        causal_mask[position[0], :, position[1] + 1:, :position[1]] = dtype_min
+    
+    return causal_mask
+
 # And to get the dataloader
-def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
+def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict, use_gist_token=False):
     """Creates a dataset and appropriate dataloader with distributed sampler."""
     # Importing here rather than at the start to avoid multiprocessing issues
     from datasets import Dataset, load_dataset
@@ -355,13 +377,13 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
 
     # # Create the InstructionDataset
     if args["dataset"] == "guanaco":
-        dataset = InstructionDataset(dataset, tokenizer, style="guanaco")
+        dataset = InstructionDataset(dataset, tokenizer, style="guanaco", use_gist_token=use_gist_token)
     elif args["dataset"] == "sql":
-        dataset = InstructionDataset(dataset, tokenizer, style="qna")
+        dataset = InstructionDataset(dataset, tokenizer, style="qna", use_gist_token=use_gist_token)
     elif args["dataset"] == "orca_math":
-        dataset = InstructionDataset(dataset, tokenizer, style="qna_no_ctx")
+        dataset = InstructionDataset(dataset, tokenizer, style="qna_no_ctx", use_gist_token=use_gist_token)
     else: # (w/ alpaca prompt formatting)
-        dataset = InstructionDataset(dataset, tokenizer, style="alpaca")
+        dataset = InstructionDataset(dataset, tokenizer, style="alpaca", use_gist_token=use_gist_token)
 
     # Collate function
     def collate_fn(batch, with_attention_mask=False):
@@ -373,17 +395,23 @@ def get_dataloader(tokenizer:PreTrainedTokenizerFast, args:Dict):
         input_ids = pad_sequence(input_ids, batch_first=True, padding_value=tokenizer.pad_token_id)[:, :args["context_length"]]
         if with_attention_mask:
             attention_masks = pad_sequence(attention_masks, batch_first=True, padding_value=0)[:, :args["context_length"]]
+            if use_gist_token:
+                gist_token_id = tokenizer.added_tokens_encoder["<|gist|>"]
+            attention_masks = get_gist_mask(input_ids, attention_masks, gist_token_id, torch.float16)
         else:
             attention_masks = None
         labels = pad_sequence(labels, batch_first=True, padding_value=-100)[:, :args["context_length"]]
         # Return dict
         return {'input_ids': input_ids, 'attention_mask': attention_masks, 'labels': labels}
 
-    # For distributed training, use DistributedSampler
-    sampler = DistributedSampler(dataset, seed=args["seed"])
+    if dist.is_initialized():
+        # For distributed training, use DistributedSampler
+        sampler = DistributedSampler(dataset, seed=args["seed"])
+    else:
+        sampler = None
 
     # Use the custom collate function in DataLoader
-    dataloader = DataLoader(dataset, batch_size=args["batch_size"], collate_fn=collate_fn, sampler=sampler)
+    dataloader = DataLoader(dataset, batch_size=args["batch_size"], collate_fn=lambda batch: collate_fn(batch, with_attention_mask=True), sampler=sampler)
 
     return dataloader
 
@@ -478,7 +506,6 @@ def get_wrapping_policy(custom_policy:bool=False, vanilla_policy:bool=False):
         policies.extend([self_attn_policy, mlp_policy])
     return functools.partial(_or_policy, policies=policies)
 
-
 # Main function, run on each process
 def fsdp_main(local_rank:int, world_size:int, args:Dict):
     profiler_context = profile(
@@ -500,7 +527,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             rank = local_rank
 
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        torch.cuda.set_device(local_rank)
+        torch.cuda.set_device(local_rank + 4)
         if args["use_cpu_offload"]:
             torch.set_num_threads(os.cpu_count()//(min(world_size, torch.cuda.device_count())))
 
@@ -541,8 +568,13 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         tokenizer = AutoTokenizer.from_pretrained(args["model_name"])
         tokenizer.pad_token_id = tokenizer.eos_token_id # TODO check if it exists first
 
+        if args['use_gist_token'] and not '<|gist|>' in tokenizer.added_tokens_encoder:
+            tokenizer.add_special_tokens(
+                {"additional_special_tokens": ["<|gist|>"] }
+            )
+
         # Set up dataloader
-        dataloader = get_dataloader(tokenizer, args)
+        dataloader = get_dataloader(tokenizer, args, use_gist_token=args['use_gist_token'])
 
 
         # Create model
@@ -648,7 +680,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         if rank == 0 or args['verbose']:
             print(f"Rank {rank}: Model created: {torch.cuda.memory_reserved(local_rank)/2**30:.3f} GiB")
 
-
+        model.resize_token_embeddings(len(tokenizer))
         # PEFT setup (LoRA and QLoRA)
         if args["train_type"] in ["lora", "qlora"]:
             from peft import get_peft_model, LoraConfig, TaskType
@@ -825,7 +857,9 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
             model.train()
             ddp_loss = torch.zeros(2).to(local_rank)
 
+            t = time.time()
             for batch_idx, batch in enumerate(dataloader):
+                logger.log({"time/dataloader_load_time": time.time() - t}, rank)
                 accumulate_grads = (batch_idx+1) % gradient_accumulation_steps == 0
 
                 # Prevent gradient syncing until update step if using no_sync option.
@@ -854,7 +888,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                         output = model(
                             batch['input_ids'].to(local_rank),
                             labels=batch['labels'].to(local_rank),
-                            attention_mask=None,
+                            attention_mask=batch['attention_mask'].to(dtype=model.dtype),
                         )
                         loss = output.loss
 
@@ -926,6 +960,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                             logger.log({"loss": log_loss, "lr": log_lr}, rank)
                     ddp_loss = torch.zeros(2).to(local_rank)
 
+                t = time.time()
             # Print + log peak memory usage for the whole fourth step of training
             if epoch == 0 and (rank == 0 or args['verbose']):
                 peak_allocated_memory = torch.cuda.max_memory_allocated(local_rank)
@@ -935,6 +970,8 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
                 if args["log_to"] == 'wandb':
                     logger.log({"memory/allocated_peak": peak_allocated_memory}, rank)
                     logger.log({"memory/reserved_peak": peak_reserved_memory}, rank)
+            
+            
 
         # Synchronize at the end and record time
         init_end_event.record()
@@ -966,6 +1003,7 @@ def fsdp_main(local_rank:int, world_size:int, args:Dict):
         if args["save_model"]:
             if rank == 0:
                 os.makedirs(args["output_dir"], exist_ok=True)
+                tokenizer.save_pretrained(args['output_dir'])
             dist.barrier()
             save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             if args["train_type"] in ["custom_lora", "custom_qlora", "hqq_lora", "hqq_dora", "bnb_dora", "bnb_llama_pro", "hqq_llama_pro"]:
@@ -1051,8 +1089,11 @@ def fsdp_qlora(
     group: str = None, # For wandb logging
     entity: str = None, # For wandb logging
     n_bits: int = 4, # passed to hqq
-    profiling_output: str = None, # Output file for profiling
-    ):
+    profiling_output: str = None, # Output file for profiling,
+    eos_text: str = "", # EOS text to be added to end of a sequence while tokenizing
+    bos_text: str = "", # BOS text to be added to the beginning of the sequence while tokenizing
+    use_gist_token: bool = True, # Whether to use a gist token
+):
     """
     Train a model with FSDP and QLoRA/QDoRA.
 
@@ -1100,6 +1141,9 @@ def fsdp_qlora(
         entity: For wandb logging
         n_bits: passed to hqq
         profiling_output: Output file for profiling
+        eos_text: EOS text to be added to end of a sequence while tokenizing
+        bos_text: BOS text to be added to the beginning of the sequence while tokenizing
+        use_gist_token Whether to use a gist token
     """
 
     # Set world size
@@ -1138,20 +1182,20 @@ def fsdp_qlora(
     # Run
     mp.spawn(fsdp_main,
         args=(world_size, args),
-        nprocs=torch.cuda.device_count(),
+        nprocs=world_size,
         join=True)
 
 # Entry point, one line wrapper around fsdp_qlora(), use fastcore's call_parse to parse args from command line
 @call_parse()
 def main(
     world_size: int = -1, # Number of GPUs to use. -1 = all available GPUs.
-    train_type: Param("", choices=["full", "lora", "qlora", "custom_qlora", "custom_lora", "hqq_lora", "hqq_dora", "bnb_dora", "bnb_llama_pro", "hqq_llama_pro"]) = "qlora", # "full", "lora", "qlora", or "custom_qlora"
+    train_type: Param("", choices=["full", "lora", "qlora", "custom_qlora", "custom_lora", "hqq_lora", "hqq_dora", "bnb_dora", "bnb_llama_pro", "hqq_llama_pro"]) = "full", # "full", "lora", "qlora", or "custom_qlora"
     llama_pro_path: str = None, # Path to the quantized llama pro model
-    batch_size: int = 1, # Batch size per GPU. Effective BS = batch_size * world_size * gradient_accumulation_steps
+    batch_size: int = 8, # Batch size per GPU. Effective BS = batch_size * world_size * gradient_accumulation_steps
     context_length: int = 512, # Max length of input sequence (in tokens)
     gradient_accumulation_steps: int = 1, # How many steps to accumulate gradients over (increases effective batch size)
     num_epochs: int = 1, # How many epochs of training to do
-    dataset: Param("", choices=["alpaca", "alpaca_sample", "dummy", "guanaco", "sql", "orca_math"]) = "alpaca_sample", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
+    dataset: Param("", choices=["alpaca", "alpaca_sample", "dummy", "guanaco", "sql", "orca_math"]) = "alpaca", # alpaca, alpaca_sample (for a 128-sample test) or "dummy" for 16 long dummy samples
     dataset_samples: int = 512, # Number of samples in an epoch if using "alpaca_sample" or "dummy" dataset
     sharding_strategy: Param("", choices=["full_shard", "shard_grad_op", "ddp", "hybrid_full_shard", "hybrid_shard_grad_op"]) = "full_shard", # Sharding strategy for FSDP
     use_gradient_checkpointing: bool_arg = True, # Use FSDP's activation checkpointing
@@ -1161,8 +1205,8 @@ def main(
     low_memory: bool_arg = True, # Load one copy of the model into CPU memory before sharding with FSDP. For QLoRA, quantizes each layer individually on GPU before placing on CPU.
     no_sync: bool_arg = False, # Prevent gradient sync until update step. Likely uses more memory. Required for `use_cpu_offload` and `gradient_accumulation_steps > 1`
     precision: Param("", choices=["fp32", "bf16", "fp16_autocast", "bf16_autocast", "bf16_buffers_autocast"]) = "bf16", # Training precision. autocast precisions use mixed precision
-    model_name: str = "meta-llama/Llama-2-7b-hf", # Which model to train - e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    save_model: bool_arg = False, # Save the resulting model
+    model_name: str = "meta-llama/Meta-Llama-3-8B", # Which model to train - e.g. "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    save_model: bool_arg =True, # Save the resulting model
     output_dir: str = "output", # Output directory to save the final model to
     lora_rank: int = 64, # LoRA rank for lora/qlora
     lora_alpha: int = 16, # LoRA alpha for lora/qlora
@@ -1177,15 +1221,18 @@ def main(
     optimizer: Param("", choices=["adamw", "adam", "sgd", "adadelta"]) = "adamw", # Optimizer
     lr_scheduler: Param("", choices=["constant", "linear", "cosine"]) = "constant", # Learning Rate Scheduler. linear and cosine warm up for 10% of training steps.
     loading_workers: int = -1, # Number of layers to load and quantize in parallel per GPU. Default of -1 uses heuristics to set worker count.
-    log_to: Param("", choices=["tqdm", "wandb", "stdout"]) = "tqdm", # Where to log output
+    log_to: Param("", choices=["tqdm", "wandb", "stdout"]) = "wandb", # Where to log output
     master_addr: str = "localhost", # For distributed training
     master_port: str = "12355", # For distributed training, must be the same for all processes
     seed: int = 42, # Random seed
     project_name: str = "fsdp_qlora", # For wandb logging
     name: str = None, # For wandb logging
-    group: str = None, # For wandb logging
-    entity: str = None, # For wandb logging
+    group: str = "finetuning-meta-llama-8b", # For wandb logging
+    entity: str = "eleutherai", # For wandb logging
     n_bits: int = 4, # passed to hqq
     profiling_output: str = "", # Output file prefix for profiling
+    eos_text: str = "", # EOS text to be added to end of a sequence while tokenizing
+    bos_text: str = "", # BOS text to be added to the beginning of the sequence while tokenizing
+    use_gist_token: bool_arg = True, # Whether to use a gist token
 ):
     fsdp_qlora(**locals())
